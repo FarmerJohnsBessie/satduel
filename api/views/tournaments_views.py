@@ -14,36 +14,23 @@ from api.views.serializers import TournamentSerializer, TournamentParticipationS
     TPSubmitAnswerSerializer
 
 
-@api_view(['GET', 'POST'])
+# DRF has no DEFAULT_PERMISSION_CLASSES here, so an @api_view without an explicit
+# @permission_classes is open to the anonymous internet. These two used to expose
+# create/edit/delete that way — any passer-by could rewrite or delete a tournament
+# and cascade away every participation in it. Nothing in the app called them
+# (creation goes through create/ and admin_create/), so they are gone rather than
+# guarded.
+@api_view(['GET'])
 def tournament_list(request):
-    if request.method == 'GET':
-        current_time = timezone.now()
-        tournaments = Tournament.objects.filter(private=False, end_time__gt=current_time)
-        serializer = TournamentSerializer(tournaments, many=True)
-        return Response(serializer.data)
-    elif request.method == 'POST':
-        serializer = TournamentSerializer(data=request.data)
-        if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    tournaments = Tournament.objects.filter(private=False, end_time__gt=timezone.now())
+    serializer = TournamentSerializer(tournaments, many=True)
+    return Response(serializer.data)
 
 
-@api_view(['GET', 'PUT', 'DELETE'])
+@api_view(['GET'])
 def tournament_detail(request, pk):
     tournament = get_object_or_404(Tournament, pk=pk)
-    if request.method == 'GET':
-        serializer = TournamentSerializer(tournament)
-        return Response(serializer.data)
-    elif request.method == 'PUT':
-        serializer = TournamentSerializer(tournament, data=request.data)
-        if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-    elif request.method == 'DELETE':
-        tournament.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
+    return Response(TournamentSerializer(tournament).data)
 
 
 @api_view(['POST'])
@@ -51,28 +38,38 @@ def tournament_detail(request, pk):
 def join_tournament(request, pk):
     tournament = get_object_or_404(Tournament, pk=pk)
     user = request.user
-    duration = tournament.duration
+    now = timezone.now()
 
-    if TournamentParticipation.objects.filter(user=user, tournament=tournament).exists():
-        participation = TournamentParticipation.objects.get(user=user, tournament=tournament)
-        serializer = TournamentParticipationSerializer(participation)
+    participation = TournamentParticipation.objects.filter(user=user, tournament=tournament).first()
+    if participation:
+        # A run whose clock expired while the tab was closed reads as Completed
+        # here, so the client sends the user to review instead of a dead round.
+        serializer = TournamentParticipationSerializer(participation.expire_if_over())
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+    if now < tournament.start_time:
+        return Response({"error": "This tournament has not started yet."}, status=status.HTTP_400_BAD_REQUEST)
+    if tournament.end_time and now >= tournament.end_time:
+        return Response({"error": "This tournament has already closed."}, status=status.HTTP_400_BAD_REQUEST)
+
+    # Joining ten minutes before close buys ten minutes, not a full duration that
+    # runs past the tournament's own deadline.
+    end_time = now + tournament.duration
+    if tournament.end_time:
+        end_time = min(end_time, tournament.end_time)
 
     participation = TournamentParticipation.objects.create(
         user=user,
         tournament=tournament,
-        start_time=timezone.now(),
-        end_time=timezone.now() + duration,
+        start_time=now,
+        end_time=end_time,
         status='Active'
     )
 
-    questions = tournament.questions.all()
-    for question in questions:
-        TournamentQuestion.objects.create(
-            participation=participation,
-            question=question,
-            status='Blank'
-        )
+    TournamentQuestion.objects.bulk_create([
+        TournamentQuestion(participation=participation, question=question, status='Blank')
+        for question in tournament.questions.all()
+    ])
 
     serializer = TournamentParticipationSerializer(participation)
     return Response(serializer.data, status=status.HTTP_201_CREATED)
@@ -84,7 +81,7 @@ def get_participation(request, pk):
     user = request.user
     tournament = get_object_or_404(Tournament, pk=pk)
     participation = get_object_or_404(TournamentParticipation, user=user, tournament=tournament)
-    serializer = TournamentParticipationSerializer(participation)
+    serializer = TournamentParticipationSerializer(participation.expire_if_over())
     return Response(serializer.data)
 
 
@@ -101,43 +98,83 @@ def get_tournament_questions(request, pk):
 
 
 @api_view(['GET'])
+@permission_classes([IsAuthenticated])
 def tournament_leaderboard(request, pk):
+    """Ranked runs for one tournament.
+
+    The per-question correct/incorrect grid is the ghost-race display, but it is
+    also a cheat sheet: post three different choices from three accounts and the
+    statuses tell you the answer. It used to be readable by anyone, logged in or
+    not. Now it needs a login, and the grid only goes to people who are actually
+    in the round; everyone else gets names, scores and ranks.
+    """
     tournament = get_object_or_404(Tournament, pk=pk)
-    participations = TournamentParticipation.objects.filter(tournament=tournament).order_by('-score',
-                                                                                            'last_correct_submission')
-    serializer = TPSubmitAnswerSerializer(participations, many=True)
+    participations = (
+        TournamentParticipation.objects
+        .filter(tournament=tournament)
+        .select_related('user')
+        .prefetch_related('tournamentquestion_set')
+        .order_by('-score', 'last_correct_submission')
+    )
+    in_round = TournamentParticipation.objects.filter(
+        user=request.user, tournament=tournament,
+    ).exists()
+    serializer = TPSubmitAnswerSerializer(
+        participations, many=True, context={'show_questions': in_round},
+    )
     return Response(serializer.data)
 
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def submit_answer(request, pk):
+    """Record one answer for the caller's own run.
+
+    This used to trust the client completely: it looked up the answer row by a
+    bare id, so any id would do, and it did `score += 1` on every correct POST.
+    Re-posting one right answer six times therefore scored six points on a
+    four-question round. Every guard below closes one of those holes, and the
+    score is recounted from the rows so it can never drift from them again.
+    """
     tournament = get_object_or_404(Tournament, pk=pk)
-    user = request.user
-    participation = get_object_or_404(TournamentParticipation, user=user, tournament=tournament)
-    data = request.data
-    question_id = data.get('question_id')
-    tournament_question_id = data.get('tournament_question_id')
-    selected_choice = data.get('selected_choice')
+    participation = get_object_or_404(
+        TournamentParticipation, user=request.user, tournament=tournament,
+    ).expire_if_over()
 
-    if not question_id or not selected_choice:
-        return Response({"error": "Question ID and answer are required"}, status=status.HTTP_400_BAD_REQUEST)
+    selected_choice = request.data.get('selected_choice')
+    tournament_question_id = request.data.get('tournament_question_id')
 
-    question = get_object_or_404(Question, id=question_id)
-    tournament_question = get_object_or_404(TournamentQuestion, id=tournament_question_id)
+    if not selected_choice or not tournament_question_id:
+        return Response({"error": "Question and answer are required"}, status=status.HTTP_400_BAD_REQUEST)
 
+    if participation.status != 'Active':
+        return Response({"error": "Your round is over."}, status=status.HTTP_403_FORBIDDEN)
+
+    # Scoping the lookup to the caller's own participation is what stops one
+    # player writing into another player's answer row — and it also makes a
+    # question from some other tournament a 404 instead of a scored answer.
+    tournament_question = get_object_or_404(
+        TournamentQuestion, id=tournament_question_id, participation=participation,
+    )
+
+    if tournament_question.status != 'Blank':
+        return Response({"error": "You already answered this question."}, status=status.HTTP_409_CONFLICT)
+
+    question = tournament_question.question
     is_correct = question.answer_text == selected_choice
     time_taken = timezone.now() - participation.start_time
 
     tournament_question.status = 'Correct' if is_correct else 'Incorrect'
+    tournament_question.selected_choice = selected_choice
     tournament_question.time_taken = time_taken
-    tournament_question.save()
+    tournament_question.save(update_fields=['status', 'selected_choice', 'time_taken'])
 
-    # Update the score of the user
+    participation.score = TournamentQuestion.objects.filter(
+        participation=participation, status='Correct',
+    ).count()
     if is_correct:
-        participation.score += 1
-        participation.last_correct_submission = timezone.now() - participation.start_time
-        participation.save()
+        participation.last_correct_submission = time_taken
+    participation.save(update_fields=['score', 'last_correct_submission'])
 
     serializer = TournamentQuestionSerializer(tournament_question)
     return Response(serializer.data, status=status.HTTP_201_CREATED)
@@ -149,8 +186,12 @@ def finish_participation(request, pk):
     tournament = get_object_or_404(Tournament, pk=pk)
     user = request.user
     participation = get_object_or_404(TournamentParticipation, user=user, tournament=tournament)
-    participation.status = 'Completed'
-    participation.save()
+    if participation.status == 'Active':
+        # Finishing early stops the clock; the run's own deadline is what review
+        # and the leaderboard compare against, so record when it actually ended.
+        participation.end_time = min(participation.end_time or timezone.now(), timezone.now())
+        participation.status = 'Completed'
+        participation.save(update_fields=['status', 'end_time'])
     serializer = TournamentParticipationSerializer(participation)
     return Response(serializer.data)
 
@@ -204,6 +245,9 @@ def create_tournament(request):
         )
         tournament.questions.add(question)
     tournament.save()
+    # create() was handed raw strings from the request body, so the in-memory
+    # instance still holds strings where the model declares datetimes.
+    tournament.refresh_from_db()
     request.user.profile.my_tournaments.add(tournament)
     serializer = TournamentSerializer(tournament)
     return Response(serializer.data, status=status.HTTP_201_CREATED)
@@ -231,6 +275,7 @@ def create_tournament_admin(request):
     questions = Question.objects.filter(id__in=question_ids)
     tournament.questions.set(questions)
     tournament.save()
+    tournament.refresh_from_db()
     profile = Profile.objects.get(user=request.user)
     profile.my_tournaments.add(tournament)
     serializer = TournamentSerializer(tournament)

@@ -9,7 +9,7 @@ from django.db import connection
 from django.test import override_settings, TransactionTestCase
 from django.urls import reverse
 from django.utils import timezone
-from rest_framework.test import APITestCase
+from rest_framework.test import APITestCase, APIClient
 
 from allauth.account.models import EmailAddress
 from api import generation
@@ -4000,3 +4000,187 @@ class ImportDuplicateTests(APITestCase):
         self.assertEqual(self.post([self.draft(
             question=legacy_math.question, question_type='Math',
         )]), {})
+
+
+class TournamentIntegrityTests(APITestCase):
+    """Guards on the competitive path: scoring, ownership, and the clock.
+
+    Each test here maps to something that was exploitable: score inflation by
+    resubmission, writing into another player's answer row, answering after the
+    round closed, joining outside the tournament window, and anonymous
+    edit/delete of a tournament.
+    """
+
+    def setUp(self):
+        from api.models import Tournament
+        self.user = User.objects.create_user('player', 'p@example.com', 'pw')
+        self.client.force_authenticate(self.user)
+        self.tournament = Tournament.objects.create(
+            name='Round', description='d',
+            start_time=timezone.now() - timedelta(minutes=5),
+            end_time=timezone.now() + timedelta(days=1),
+            duration=timedelta(minutes=30),
+        )
+        self.questions = [
+            Question.objects.create(
+                question=f'q{i}', choice_a='right', choice_b='b', choice_c='c', choice_d='d',
+                answer='A', difficulty=1, explanation=f'because {i}',
+            ) for i in range(3)
+        ]
+        self.tournament.questions.set(self.questions)
+
+    def join(self, client=None):
+        client = client or self.client
+        client.post(f'/api/tournaments/{self.tournament.id}/join/', {}, format='json')
+        return client.post(f'/api/tournaments/{self.tournament.id}/questions/', {}, format='json').data
+
+    def answer(self, row, choice, client=None):
+        return (client or self.client).post(
+            f'/api/tournaments/{self.tournament.id}/submit-answer/',
+            {'tournament_question_id': row['id'], 'selected_choice': choice}, format='json',
+        )
+
+    def participation(self, user=None):
+        from api.models import TournamentParticipation
+        return TournamentParticipation.objects.get(user=user or self.user, tournament=self.tournament)
+
+    def test_resubmitting_one_question_cannot_inflate_the_score(self):
+        rows = self.join()
+        self.assertEqual(self.answer(rows[0], 'right').status_code, 201)
+        for _ in range(5):
+            self.assertEqual(self.answer(rows[0], 'right').status_code, 409)
+        self.assertEqual(self.participation().score, 1)
+
+    def test_score_never_exceeds_the_question_count(self):
+        rows = self.join()
+        for row in rows:
+            self.answer(row, 'right')
+        self.assertEqual(self.participation().score, len(self.questions))
+
+    def test_cannot_write_into_another_players_answer_row(self):
+        from api.models import TournamentQuestion
+        victim = User.objects.create_user('victim', 'v@example.com', 'pw')
+        victim_client = APIClient()
+        victim_client.force_authenticate(victim)
+        self.join(victim_client)
+        victim_row = TournamentQuestion.objects.filter(participation__user=victim).first()
+
+        self.join()
+        response = self.answer({'id': victim_row.id}, 'right')
+
+        self.assertEqual(response.status_code, 404)
+        victim_row.refresh_from_db()
+        self.assertEqual(victim_row.status, 'Blank')
+
+    def test_cannot_answer_after_the_clock_runs_out(self):
+        rows = self.join()
+        participation = self.participation()
+        participation.end_time = timezone.now() - timedelta(minutes=1)
+        participation.save(update_fields=['end_time'])
+
+        self.assertEqual(self.answer(rows[0], 'right').status_code, 403)
+        self.assertEqual(self.participation().score, 0)
+
+    def test_cannot_answer_after_finishing(self):
+        rows = self.join()
+        self.client.post(f'/api/tournaments/{self.tournament.id}/finish/', {}, format='json')
+        self.assertEqual(self.answer(rows[0], 'right').status_code, 403)
+
+    def test_cannot_join_before_start_or_after_close(self):
+        from api.models import Tournament
+        upcoming = Tournament.objects.create(
+            name='Later', description='d', start_time=timezone.now() + timedelta(days=7),
+            end_time=timezone.now() + timedelta(days=8), duration=timedelta(minutes=30))
+        closed = Tournament.objects.create(
+            name='Over', description='d', start_time=timezone.now() - timedelta(days=8),
+            end_time=timezone.now() - timedelta(days=7), duration=timedelta(minutes=30))
+
+        self.assertEqual(self.client.post(f'/api/tournaments/{upcoming.id}/join/', {}, format='json').status_code, 400)
+        self.assertEqual(self.client.post(f'/api/tournaments/{closed.id}/join/', {}, format='json').status_code, 400)
+
+    def test_a_run_cannot_outlast_the_tournament(self):
+        from api.models import Tournament
+        closing_soon = Tournament.objects.create(
+            name='Closing', description='d', start_time=timezone.now() - timedelta(minutes=1),
+            end_time=timezone.now() + timedelta(minutes=5), duration=timedelta(minutes=30))
+        closing_soon.questions.set(self.questions)
+
+        self.client.post(f'/api/tournaments/{closing_soon.id}/join/', {}, format='json')
+
+        self.assertLessEqual(self.participation_for(closing_soon).end_time, closing_soon.end_time)
+
+    def participation_for(self, tournament):
+        from api.models import TournamentParticipation
+        return TournamentParticipation.objects.get(user=self.user, tournament=tournament)
+
+    def test_anonymous_cannot_edit_or_delete_a_tournament(self):
+        from api.models import Tournament
+        anon = APIClient()
+        self.assertIn(anon.delete(f'/api/tournaments/{self.tournament.id}/').status_code, (403, 405))
+        self.assertIn(anon.put(f'/api/tournaments/{self.tournament.id}/', {'name': 'HACKED'},
+                               format='json').status_code, (403, 405))
+        self.assertTrue(Tournament.objects.filter(id=self.tournament.id).exists())
+        self.tournament.refresh_from_db()
+        self.assertEqual(self.tournament.name, 'Round')
+
+
+class TournamentReviewTests(APITestCase):
+    """What review needs: the user's own choice, and answers that stay reachable."""
+
+    def setUp(self):
+        from api.models import Tournament
+        self.user = User.objects.create_user('reviewer', 'r@example.com', 'pw')
+        self.client.force_authenticate(self.user)
+        self.tournament = Tournament.objects.create(
+            name='Round', description='d',
+            start_time=timezone.now() - timedelta(minutes=5),
+            end_time=timezone.now() + timedelta(days=1),
+            duration=timedelta(minutes=30),
+        )
+        self.question = Question.objects.create(
+            question='q', choice_a='right', choice_b='wrong', choice_c='c', choice_d='d',
+            answer='A', difficulty=1, explanation='because',
+        )
+        self.tournament.questions.set([self.question])
+
+    def test_review_records_which_choice_the_user_picked(self):
+        self.client.post(f'/api/tournaments/{self.tournament.id}/join/', {}, format='json')
+        rows = self.client.post(f'/api/tournaments/{self.tournament.id}/questions/', {}, format='json').data
+        self.client.post(f'/api/tournaments/{self.tournament.id}/submit-answer/',
+                         {'tournament_question_id': rows[0]['id'], 'selected_choice': 'wrong'}, format='json')
+        self.client.post(f'/api/tournaments/{self.tournament.id}/finish/', {}, format='json')
+
+        reviewed = self.client.post(f'/api/tournaments/{self.tournament.id}/questions/', {}, format='json').data
+        self.assertEqual(reviewed[0]['status'], 'Incorrect')
+        self.assertEqual(reviewed[0]['selected_choice'], 'wrong')
+
+    def test_an_abandoned_run_stops_hiding_answers_once_its_clock_expires(self):
+        from api.models import TournamentParticipation
+        self.client.post(f'/api/tournaments/{self.tournament.id}/join/', {}, format='json')
+        blocked = self.client.post('/api/get_answer/', {'question_id': self.question.id}, format='json')
+        self.assertEqual(blocked.status_code, 403)
+
+        # The tab was closed, so nothing ever called finish/ — the row stays Active.
+        participation = TournamentParticipation.objects.get(user=self.user, tournament=self.tournament)
+        participation.end_time = timezone.now() - timedelta(minutes=1)
+        participation.save(update_fields=['end_time'])
+        self.assertEqual(participation.status, 'Active')
+
+        allowed = self.client.post('/api/get_answer/', {'question_id': self.question.id}, format='json')
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(allowed.data['explanation'], 'because')
+
+    def test_leaderboard_needs_a_login_and_hides_the_grid_from_outsiders(self):
+        self.client.post(f'/api/tournaments/{self.tournament.id}/join/', {}, format='json')
+        url = f'/api/tournaments/{self.tournament.id}/leaderboard/'
+
+        self.assertEqual(APIClient().get(url).status_code, 401)
+
+        outsider = APIClient()
+        outsider.force_authenticate(User.objects.create_user('outsider', 'o@example.com', 'pw'))
+        rows = outsider.get(url).data
+        self.assertEqual(rows[0]['tournament_questions'], [])
+        self.assertIn('score', rows[0])
+
+        own = self.client.get(url).data
+        self.assertEqual(len(own[0]['tournament_questions']), 1)
