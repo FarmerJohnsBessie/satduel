@@ -616,8 +616,36 @@ class TournamentParticipation(models.Model):
     def __str__(self):
         return f"{self.user.username} in {self.tournament.name}"
 
-    def save(self, *args, **kwargs):
-        super().save(*args, **kwargs)
+    @property
+    def is_live(self):
+        """True while the run is still on the clock.
+
+        A run is only marked Completed when something calls finish/, which for
+        a long time meant "the browser tab happened to be open when the timer
+        hit zero". Abandoned runs stayed Active forever and kept hiding their
+        questions from every review surface, so liveness is derived from the
+        deadline rather than trusted from the column.
+        """
+        return self.status == 'Active' and (self.end_time is None or timezone.now() < self.end_time)
+
+    def expire_if_over(self):
+        """Close out a run whose clock ran out while nobody was watching."""
+        if self.status == 'Active' and self.end_time and timezone.now() >= self.end_time:
+            self.status = 'Completed'
+            self.save(update_fields=['status'])
+        return self
+
+    @staticmethod
+    def live_for(user):
+        """Runs `user` is genuinely still competing in — the anti-cheat gate.
+
+        A row with no end_time has no deadline to have passed, so it counts as
+        live: this gate fails closed.
+        """
+        return TournamentParticipation.objects.filter(
+            models.Q(end_time__gt=timezone.now()) | models.Q(end_time__isnull=True),
+            user=user, status='Active',
+        )
 
 
 class TournamentQuestion(models.Model):
@@ -625,6 +653,9 @@ class TournamentQuestion(models.Model):
     question = models.ForeignKey(Question, on_delete=models.CASCADE)
     status = models.CharField(max_length=10,
                               choices=[('Correct', 'Correct'), ('Incorrect', 'Incorrect'), ('Blank', 'Blank')])
+    # What the user actually picked, so review can show their answer next to the
+    # correct one instead of only saying "Incorrect".
+    selected_choice = models.CharField(max_length=1000, blank=True, default='')
     time_taken = models.DurationField(blank=True, null=True)  # Time taken to answer from start of participation
 
     def __str__(self):

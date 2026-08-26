@@ -1,3 +1,4 @@
+from django.utils import timezone
 from django.contrib.auth.models import User
 from api.models import DUEL_EMOJIS, PREMIUM_DUEL_EMOJIS, DirectMessage, Question, Profile, Room, TrackedQuestion, FriendRequest, \
     UserStatistics, Tournament, TournamentParticipation, TournamentQuestion
@@ -193,11 +194,22 @@ class DirectMessageSerializer(serializers.ModelSerializer):
 class TournamentSerializer(serializers.ModelSerializer):
     participantNumber = serializers.IntegerField(read_only=True)
     questionNumber = serializers.IntegerField(read_only=True)
+    # TournamentCard has always rendered `tournament.status`, which nothing sent,
+    # so every card claimed to be ACTIVE — including rounds that closed weeks ago.
+    status = serializers.SerializerMethodField()
 
     class Meta:
         model = Tournament
         fields = ['id', 'name', 'description', 'duration', 'start_time', 'end_time', 'participantNumber',
-                  'questionNumber', 'private', 'join_code']
+                  'questionNumber', 'private', 'join_code', 'status']
+
+    def get_status(self, obj):
+        now = timezone.now()
+        if obj.start_time and now < obj.start_time:
+            return 'upcoming'
+        if obj.end_time and now >= obj.end_time:
+            return 'ended'
+        return 'active'
 
 
 class TournamentParticipationSerializer(serializers.ModelSerializer):
@@ -213,7 +225,7 @@ class TournamentQuestionSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = TournamentQuestion
-        fields = ['id', 'participation', 'question', 'status', 'time_taken']
+        fields = ['id', 'participation', 'question', 'status', 'selected_choice', 'time_taken']
 
 
 class TPSubmitAnswerSerializer(serializers.ModelSerializer):
@@ -225,6 +237,9 @@ class TPSubmitAnswerSerializer(serializers.ModelSerializer):
         fields = ['id', 'user', 'score', 'last_correct_submission', 'tournament_questions']
 
     def get_tournament_questions(self, obj):
-        # Retrieve and order the questions by ID
-        questions = obj.tournamentquestion_set.all().order_by('id')
+        # Only people in the round see the per-question grid — see
+        # tournament_leaderboard for why. Others still get score and rank.
+        if not self.context.get('show_questions'):
+            return []
+        questions = sorted(obj.tournamentquestion_set.all(), key=lambda q: q.id)
         return TournamentQuestionSerializer(questions, many=True).data

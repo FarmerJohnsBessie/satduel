@@ -487,9 +487,10 @@ def get_answer(request):
         return Response({'error': 'Question does not exist'}, status=404)
 
     from api.models import TournamentParticipation, Room, TrackedQuestion
-    in_active_tournament = TournamentParticipation.objects.filter(
-        user=request.user,
-        status='Active',
+    # live_for() excludes runs whose clock has expired. Without that, abandoning
+    # one round left its questions unrevealable forever — including in the review
+    # of a tournament the user had already finished.
+    in_active_tournament = TournamentParticipation.live_for(request.user).filter(
         tournament__questions=question,
     ).exists()
     active_duel = Room.objects.filter(

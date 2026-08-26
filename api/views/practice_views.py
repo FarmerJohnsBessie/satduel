@@ -573,9 +573,9 @@ def exclude_live_questions(queryset, user):
     be a cheat sheet for a question the user still has to answer for real.
     """
     from api.models import TournamentParticipation, TrackedQuestion
-    tournament_questions = TournamentParticipation.objects.filter(
-        user=user, status='Active',
-    ).values_list('tournament__questions', flat=True)
+    tournament_questions = TournamentParticipation.live_for(user).values_list(
+        'tournament__questions', flat=True,
+    )
     duel_questions = TrackedQuestion.objects.filter(
         user=user, room__status='Battling', status='Blank',
     ).values_list('question_id', flat=True)
